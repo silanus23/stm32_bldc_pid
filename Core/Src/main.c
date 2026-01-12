@@ -77,28 +77,24 @@ typedef struct __attribute__((packed)) {
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim4;
 
-/* Definitions for pidTask */
 osThreadId_t pidTaskHandle;
 const osThreadAttr_t pidTask_attributes = {
   .name = "pidTask",
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
-/* Definitions for usbTask */
 osThreadId_t usbTaskHandle;
 const osThreadAttr_t usbTask_attributes = {
   .name = "usbTask",
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
-/* Definitions for tachoTask */
 osThreadId_t tachoTaskHandle;
 const osThreadAttr_t tachoTask_attributes = {
   .name = "tachoTask",
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityHigh,
 };
-/* Definitions for tachoSemaphore */
 osSemaphoreId_t tachoSemaphoreHandle;
 const osSemaphoreAttr_t tachoSemaphore_attributes = {
   .name = "tachoSemaphore"
@@ -121,11 +117,9 @@ volatile float max_rpm = 3100.0f;
 volatile uint32_t last_capture_time_us = 0;
 volatile uint32_t current_capture_time_us = 0;
 
-// Manual Mode Variables
 volatile bool manual_mode = false;
 volatile float manual_pwm = 0.0f;
 
-// Bumpless Transfer State
 volatile bool pending_bumpless_transfer = false;
 
 // Debugging
@@ -154,7 +148,12 @@ bool Save_Settings(void);
 void Load_Settings(void);
 float calculate_feedforward_pwm(float rpm);
 
-/* Atomic read helpers for multi-byte volatile variables */
+/**
+ * @brief Atomically reads a float value from a volatile pointer.
+ * @param ptr Pointer to the volatile float variable to read
+ * @retval The float value read from the pointer
+ * @note Uses kernel lock to ensure thread-safe access
+ */
 static inline float atomic_read_float(volatile float *ptr)
 {
     float val;
@@ -164,6 +163,12 @@ static inline float atomic_read_float(volatile float *ptr)
     return val;
 }
 
+/**
+ * @brief Atomically reads a boolean value from a volatile pointer.
+ * @param ptr Pointer to the volatile bool variable to read
+ * @retval The boolean value read from the pointer
+ * @note Uses kernel lock to ensure thread-safe access
+ */
 static inline bool atomic_read_bool(volatile bool *ptr)
 {
     bool val;
@@ -173,6 +178,13 @@ static inline bool atomic_read_bool(volatile bool *ptr)
     return val;
 }
 
+/**
+ * @brief Atomically writes a float value to a volatile pointer.
+ * @param ptr Pointer to the volatile float variable to write
+ * @param val The float value to write
+ * @retval None
+ * @note Uses kernel lock to ensure thread-safe access
+ */
 static inline void atomic_write_float(volatile float *ptr, float val)
 {
     osKernelLock();
@@ -215,10 +227,8 @@ int main(void)
   /* Init scheduler */
   osKernelInitialize();
 
-  /* Create the semaphores */
   tachoSemaphoreHandle = osSemaphoreNew(1, 0, &tachoSemaphore_attributes);
 
-  /* Create the threads */
   pidTaskHandle = osThreadNew(StartPidTask, NULL, &pidTask_attributes);
   usbTaskHandle = osThreadNew(StartUsbTask, NULL, &usbTask_attributes);
   tachoTaskHandle = osThreadNew(StartTachoTask, NULL, &tachoTask_attributes);
@@ -271,10 +281,13 @@ void SystemClock_Config(void)
 }
 
 /**
-  * @brief TIM2 Initialization Function (Microsecond Timer)
-  * @param None
-  * @retval None
-  */
+ * @brief TIM2 Initialization Function (Microsecond Timer)
+ * @param None
+ * @retval None
+ * @note Configured as a 32-bit free-running microsecond counter
+ * @note Prescaler set to 83 for 1MHz counting (assuming 84MHz APB1)
+ * @note Used for tachometer pulse timing measurements
+ */
 static void MX_TIM2_Init(void)
 {
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
@@ -304,10 +317,13 @@ static void MX_TIM2_Init(void)
 }
 
 /**
-  * @brief TIM4 Initialization Function (PWM Generation)
-  * @param None
-  * @retval None
-  */
+ * @brief TIM4 Initialization Function (PWM Generation)
+ * @param None
+ * @retval None
+ * @note Configured for PWM output on Channel 1 (PD12)
+ * @note PWM frequency ~25kHz (prescaler 83, period 399)
+ * @note Used to control fan motor speed
+ */
 static void MX_TIM4_Init(void)
 {
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
@@ -351,10 +367,13 @@ static void MX_TIM4_Init(void)
 }
 
 /**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
+ * @brief GPIO Initialization Function
+ * @param None
+ * @retval None
+ * @note Configures PA0 as tachometer input with falling edge interrupt
+ * @note Configures PD12-PD15 as outputs for onboard LEDs
+ * @note Enables EXTI0 interrupt for tachometer signal
+ */
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -389,8 +408,9 @@ static void MX_GPIO_Init(void)
 
 /**
  * @brief Calculates the feedforward PWM value using linear interpolation.
- * @param rpm: The target RPM.
- * @retval The estimated PWM value required to achieve that RPM.
+ * @param rpm The target RPM for which to calculate PWM
+ * @retval The estimated PWM value (percentage) required to achieve the target RPM
+ * @note Uses predefined lookup table with linear interpolation between points
  */
 float calculate_feedforward_pwm(float rpm)
 {
@@ -420,8 +440,11 @@ float calculate_feedforward_pwm(float rpm)
 }
 
 /**
- * @brief Saves settings to flash with verification.
- * @retval true if successful, false otherwise.
+ * @brief Saves PID settings to flash memory with verification.
+ * @retval true if settings were successfully written and verified
+ * @retval false if flash erase, write, or verification failed
+ * @note Saves Kp, Ki, Kd, and max_rpm to flash sector 11
+ * @note Automatically unlocks and locks flash during operation
  */
 bool Save_Settings(void)
 {
@@ -482,7 +505,11 @@ bool Save_Settings(void)
 }
 
 /**
- * @brief Loads settings from flash if valid.
+ * @brief Loads PID settings from flash memory if valid magic number is present.
+ * @retval None
+ * @note Validates flash data using magic number before loading
+ * @note If magic number is invalid, default values are retained
+ * @note Loads Kp, Ki, Kd, and max_rpm from flash sector 11
  */
 void Load_Settings(void)
 {
@@ -499,7 +526,13 @@ void Load_Settings(void)
 
 
 /**
- * @brief  Function implementing the tachoTask thread.
+ * @brief Function implementing the tachoTask thread.
+ * @param argument Unused thread argument (required by RTOS)
+ * @retval None
+ * @note Calculates RPM from tachometer pulses using time measurement
+ * @note Implements timeout detection for stalled fan conditions
+ * @note Rejects first pulse after startup to avoid measurement errors
+ * @note High priority task to ensure accurate timing measurements
  */
 void StartTachoTask(void *argument)
 {
@@ -543,7 +576,15 @@ void StartTachoTask(void *argument)
 }
 
 /**
- * @brief Function implementing the pidTask thread.
+ * @brief Function implementing the PID controller task thread.
+ * @param argument Unused thread argument (required by RTOS)
+ * @retval None
+ * @note Executes at fixed sample time defined by PID_SAMPLE_TIME_S
+ * @note Implements feedforward control with PID feedback
+ * @note Uses derivative-on-measurement to prevent derivative kick
+ * @note Includes anti-windup with feedforward compensation
+ * @note Supports bumpless transfer from manual to automatic mode
+ * @note Enforces minimum 10% PWM output (except when setpoint is 0)
  */
 void StartPidTask(void *argument)
 {
@@ -662,8 +703,13 @@ void StartPidTask(void *argument)
 }
 
 /**
-* @brief Function implementing the usbTask thread.
-*/
+ * @brief Function implementing the USB telemetry task thread.
+ * @param argument Unused thread argument (required by RTOS)
+ * @retval None
+ * @note Transmits telemetry data via USB CDC at 250ms intervals
+ * @note Implements retry logic for USB transmit failures
+ * @note Reports timestamp, setpoint, measured RPM, and PWM output
+ */
 void StartUsbTask(void *argument)
 {
   osDelay(2500);
@@ -701,10 +747,12 @@ void StartUsbTask(void *argument)
 }
 
 /**
-  * @brief  Sets the fan's PWM duty cycle.
-  * @param  duty_cycle: The desired duty cycle from 0.0f to 100.0f.
-  * @retval None
-  */
+ * @brief Sets the fan's PWM duty cycle.
+ * @param duty_cycle The desired duty cycle from 0.0f to 100.0f
+ * @retval None
+ * @note Automatically clamps input to valid range [0.0, 100.0]
+ * @note Updates TIM4 Channel 1 compare register to control PWM output
+ */
 void set_fan_speed(float duty_cycle)
 {
     if (duty_cycle < 0.0f) duty_cycle = 0.0f;
@@ -717,8 +765,13 @@ void set_fan_speed(float duty_cycle)
 }
 
 /**
-  * @brief  External Interrupt ISR for tachometer input (PA0).
-  */
+ * @brief External Interrupt ISR callback for tachometer input (PA0).
+ * @param GPIO_Pin The GPIO pin that triggered the interrupt
+ * @retval None
+ * @note Captures timestamp and releases semaphore for tachoTask
+ * @note Triggered on falling edge of tachometer signal
+ * @note ISR - keep processing minimal
+ */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == GPIO_PIN_0) {
@@ -728,10 +781,13 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 }
 
 /**
- * @brief  Parses a float from string with validation.
- * @param  str: Input string.
- * @param  out: Pointer to store result.
- * @retval true if valid number, false otherwise.
+ * @brief Parses a float from string with validation.
+ * @param str Input string to parse
+ * @param out Pointer to store the parsed float result
+ * @retval true if valid number was successfully parsed
+ * @retval false if parsing failed (invalid format, NULL input, etc.)
+ * @note Skips leading/trailing whitespace
+ * @note Uses strtof for conversion with error checking
  */
 static bool parse_float(const char* str, float* out)
 {
@@ -772,10 +828,20 @@ static bool parse_float(const char* str, float* out)
 }
 
 /**
- * @brief  Processes received USB data to set RPM and PID gains. (Robust Version)
- * @param  Buf: Buffer of received data.
- * @param  Len: Length of the data.
+ * @brief Processes received USB data to set RPM and PID gains.
+ * @param Buf Buffer of received data
+ * @param Len Length of the data buffer
  * @retval None
+ * @note Supported commands:
+ *       - 's<value>': Set RPM setpoint (0-4000)
+ *       - 'm<value>': Set manual PWM mode (0-100%)
+ *       - 'p<value>': Set proportional gain Kp
+ *       - 'i<value>': Set integral gain Ki
+ *       - 'd<value>': Set derivative gain Kd
+ *       - 'r<value>': Set max RPM limit (100-10000)
+ *       - 'save': Save settings to flash
+ * @note Implements bumpless transfer when switching from manual to automatic
+ * @note Uses robust parsing with validation
  */
 void process_usb_command(uint8_t* Buf, uint32_t Len)
 {
@@ -794,7 +860,6 @@ void process_usb_command(uint8_t* Buf, uint32_t Len)
                 char* value_str = &command_buffer[1];
                 float new_val = 0.0f;
 
-                // Check for multi-character commands first
                 if (strncmp(command_buffer, "save", 4) == 0)
                 {
                     if (Save_Settings())
