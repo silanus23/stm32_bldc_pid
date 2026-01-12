@@ -447,7 +447,7 @@ bool Save_Settings(void)
     if (HAL_FLASHEx_Erase(&EraseInitStruct, &SectorError) == HAL_OK)
     {
         uint32_t* p_settings = (uint32_t*)&settings;
-        uint32_t num_words = (sizeof(Flash_Settings) + 3) / 4; // Round up to word boundary
+        uint32_t num_words = (sizeof(Flash_Settings) + 3) / 4;
         
         for (uint32_t i = 0; i < num_words; i++)
         {
@@ -574,7 +574,6 @@ void StartPidTask(void *argument)
 
     if (do_bumpless && !is_manual)
     {
-        // Initialize integral to produce current output smoothly
         float ff_term = calculate_feedforward_pwm(local_setpoint);
         float current_output = atomic_read_float(&pid_output);
         float error = local_setpoint - local_measured;
@@ -585,6 +584,16 @@ void StartPidTask(void *argument)
         if (local_Ki > 0.001f)
         {
             float new_integral = (current_output - ff_term - p_term) / local_Ki;
+            
+            // Clamp using same limits as normal anti-windup
+            float integral_headroom = PID_OUTPUT_MAX - ff_term;
+            float integral_floor = PID_OUTPUT_MIN - ff_term;
+            float max_integral = integral_headroom / local_Ki;
+            float min_integral = integral_floor / local_Ki;
+            
+            if (new_integral > max_integral) new_integral = max_integral;
+            else if (new_integral < min_integral) new_integral = min_integral;
+            
             osKernelLock();
             integral = new_integral;
             osKernelUnlock();
@@ -613,16 +622,10 @@ void StartPidTask(void *argument)
       continue; 
     }
 
-    // PID Calculation 
     float error = local_setpoint - local_measured;
 
-    // Proportional Term 
     float p_term = local_Kp * error;
-
-    // Feedforward Term 
     float ff_term = calculate_feedforward_pwm(local_setpoint);
-
-    // Integral term
     osKernelLock();
     integral += error * PID_SAMPLE_TIME_S;
     
@@ -641,16 +644,12 @@ void StartPidTask(void *argument)
     float current_integral = integral;
     osKernelUnlock();
 
-    // Integral Term
     float i_term = local_Ki * current_integral;
 
-    // Derivative Term
     float derivative = -(local_measured - last_measured_rpm) / PID_SAMPLE_TIME_S;
     float d_term = local_Kd * derivative;
 
     last_measured_rpm = local_measured;
-
-    // Total PID Output + Feedforward
     float output = ff_term + p_term + i_term + d_term;
 
     // Clamp the final output
