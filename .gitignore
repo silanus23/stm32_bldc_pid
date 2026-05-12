@@ -17,6 +17,7 @@
 *.vshost.exe.manifest
 
 .vscode/
+.zed/
 
 .settings/
 .project

@@ -3,25 +3,6 @@
  ******************************************************************************
  * @file              : main.c
  * @brief             : Main program body for STM32F407G-DISC1 PID Fan Controller
- * @attention
- *
- *
- * - Fixes critical race condition on the 'integral' variable using a
- * critical section (osKernelLock/Unlock).
- * - Implements "derivative on measurement" to prevent derivative kick.
- * - Provides non-zero starting PID gains (Kp, Ki, Kd) for actual control.
- * - Includes robust tachometer logic with a timeout for stalled fans and
- * first-pulse rejection.
- * - Uses snprintf for safer string formatting in the USB task.
- * - MODIFIED: Implements a 10% minimum PWM output, while allowing the fan
- * to be fully turned off (0% PWM) when the setpoint is 0 RPM.
- * - Atomic reads for shared volatile variables.
- * - Improved anti-windup accounting for feedforward.
- * - Flash write verification.
- * - Bumpless transfer from manual to PID mode.
- * - USB transmit busy handling.
- * - Command parsing validation.
- *
  ******************************************************************************
  */
 /* USER CODE END Header */
@@ -64,8 +45,8 @@ typedef struct __attribute__((packed)) {
 #define PID_SAMPLE_TIME_S 0.025f
 #define PID_OUTPUT_MAX 95.0f
 #define PID_OUTPUT_MIN 10.0f
-#define FLASH_SETTINGS_ADDRESS  0x080E0000  
-#define FLASH_MAGIC_NUMBER      0xDEADBEEF 
+#define FLASH_SETTINGS_ADDRESS  0x080E0000
+#define FLASH_MAGIC_NUMBER      0xDEADBEEF
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -148,12 +129,7 @@ bool Save_Settings(void);
 void Load_Settings(void);
 float calculate_feedforward_pwm(float rpm);
 
-/**
- * @brief Atomically reads a float value from a volatile pointer.
- * @param ptr Pointer to the volatile float variable to read
- * @retval The float value read from the pointer
- * @note Uses kernel lock to ensure thread-safe access
- */
+/* Task-context only. Not safe to call from ISR. */
 static inline float atomic_read_float(volatile float *ptr)
 {
     float val;
@@ -163,12 +139,7 @@ static inline float atomic_read_float(volatile float *ptr)
     return val;
 }
 
-/**
- * @brief Atomically reads a boolean value from a volatile pointer.
- * @param ptr Pointer to the volatile bool variable to read
- * @retval The boolean value read from the pointer
- * @note Uses kernel lock to ensure thread-safe access
- */
+/* Task-context only. Not safe to call from ISR. */
 static inline bool atomic_read_bool(volatile bool *ptr)
 {
     bool val;
@@ -178,13 +149,7 @@ static inline bool atomic_read_bool(volatile bool *ptr)
     return val;
 }
 
-/**
- * @brief Atomically writes a float value to a volatile pointer.
- * @param ptr Pointer to the volatile float variable to write
- * @param val The float value to write
- * @retval None
- * @note Uses kernel lock to ensure thread-safe access
- */
+/* Task-context only. Not safe to call from ISR. */
 static inline void atomic_write_float(volatile float *ptr, float val)
 {
     osKernelLock();
@@ -207,7 +172,7 @@ int main(void)
 {
   /* MCU Configuration--------------------------------------------------------*/
   HAL_Init();
-  Load_Settings(); 
+  Load_Settings();
 
   SystemClock_Config();
 
@@ -319,9 +284,8 @@ static void MX_TIM2_Init(void)
 /**
  * @brief TIM4 Initialization Function (PWM Generation)
  * @param None
- * @retval None
  * @note Configured for PWM output on Channel 1 (PD12)
- * @note PWM frequency ~25kHz (prescaler 83, period 399)
+ * @note PWM frequency ~2.5kHz (prescaler 83, period 399)
  * @note Used to control fan motor speed
  */
 static void MX_TIM4_Init(void)
@@ -369,7 +333,6 @@ static void MX_TIM4_Init(void)
 /**
  * @brief GPIO Initialization Function
  * @param None
- * @retval None
  * @note Configures PA0 as tachometer input with falling edge interrupt
  * @note Configures PD12-PD15 as outputs for onboard LEDs
  * @note Enables EXTI0 interrupt for tachometer signal
@@ -378,28 +341,23 @@ static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-  /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15, GPIO_PIN_RESET);
 
-  /* PA0 (Tachometer Input) */
   GPIO_InitStruct.Pin = GPIO_PIN_0;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /* GPIO pins : PD12 PD13 PD14 PD15 (On-board LEDs) */
   GPIO_InitStruct.Pin = GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 }
@@ -441,8 +399,6 @@ float calculate_feedforward_pwm(float rpm)
 
 /**
  * @brief Saves PID settings to flash memory with verification.
- * @retval true if settings were successfully written and verified
- * @retval false if flash erase, write, or verification failed
  * @note Saves Kp, Ki, Kd, and max_rpm to flash sector 11
  * @note Automatically unlocks and locks flash during operation
  */
@@ -471,7 +427,7 @@ bool Save_Settings(void)
     {
         uint32_t* p_settings = (uint32_t*)&settings;
         uint32_t num_words = (sizeof(Flash_Settings) + 3) / 4;
-        
+
         for (uint32_t i = 0; i < num_words; i++)
         {
             if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, FLASH_SETTINGS_ADDRESS + (i * 4), p_settings[i]) != HAL_OK)
@@ -481,7 +437,6 @@ bool Save_Settings(void)
             }
         }
 
-        // Verify written data
         if (success)
         {
             uint32_t* flash_data = (uint32_t*)FLASH_SETTINGS_ADDRESS;
@@ -506,7 +461,6 @@ bool Save_Settings(void)
 
 /**
  * @brief Loads PID settings from flash memory if valid magic number is present.
- * @retval None
  * @note Validates flash data using magic number before loading
  * @note If magic number is invalid, default values are retained
  * @note Loads Kp, Ki, Kd, and max_rpm from flash sector 11
@@ -528,7 +482,6 @@ void Load_Settings(void)
 /**
  * @brief Function implementing the tachoTask thread.
  * @param argument Unused thread argument (required by RTOS)
- * @retval None
  * @note Calculates RPM from tachometer pulses using time measurement
  * @note Implements timeout detection for stalled fan conditions
  * @note Rejects first pulse after startup to avoid measurement errors
@@ -578,7 +531,6 @@ void StartTachoTask(void *argument)
 /**
  * @brief Function implementing the PID controller task thread.
  * @param argument Unused thread argument (required by RTOS)
- * @retval None
  * @note Executes at fixed sample time defined by PID_SAMPLE_TIME_S
  * @note Implements feedforward control with PID feedback
  * @note Uses derivative-on-measurement to prevent derivative kick
@@ -598,7 +550,6 @@ void StartPidTask(void *argument)
     tick += (uint32_t)(PID_SAMPLE_TIME_S * 1000.0f);
     osDelayUntil(tick);
 
-    // Read shared variables atomically
     bool is_manual = atomic_read_bool(&manual_mode);
     float local_setpoint = atomic_read_float(&setpoint_rpm);
     float local_measured = atomic_read_float(&measured_rpm);
@@ -607,7 +558,6 @@ void StartPidTask(void *argument)
     float local_Ki = atomic_read_float(&Ki);
     float local_Kd = atomic_read_float(&Kd);
 
-    // Check for bumpless transfer request
     osKernelLock();
     bool do_bumpless = pending_bumpless_transfer;
     pending_bumpless_transfer = false;
@@ -619,22 +569,22 @@ void StartPidTask(void *argument)
         float current_output = atomic_read_float(&pid_output);
         float error = local_setpoint - local_measured;
         float p_term = local_Kp * error;
-        
+
         // Back-calculate integral: output = ff + p + Ki*integral
         // So integral = (output - ff - p) / Ki
         if (local_Ki > 0.001f)
         {
             float new_integral = (current_output - ff_term - p_term) / local_Ki;
-            
+
             // Clamp using same limits as normal anti-windup
             float integral_headroom = PID_OUTPUT_MAX - ff_term;
             float integral_floor = PID_OUTPUT_MIN - ff_term;
             float max_integral = integral_headroom / local_Ki;
             float min_integral = integral_floor / local_Ki;
-            
+
             if (new_integral > max_integral) new_integral = max_integral;
             else if (new_integral < min_integral) new_integral = min_integral;
-            
+
             osKernelLock();
             integral = new_integral;
             osKernelUnlock();
@@ -642,7 +592,6 @@ void StartPidTask(void *argument)
         last_measured_rpm = local_measured;
     }
 
-    // Check for manual override first
     if (is_manual)
     {
         set_fan_speed(local_manual_pwm);
@@ -650,7 +599,6 @@ void StartPidTask(void *argument)
         continue;
     }
 
-    // If the setpoint is zero, turn the fan off and reset the controller.
     if (local_setpoint <= 0.0f)
     {
       osKernelLock();
@@ -660,7 +608,7 @@ void StartPidTask(void *argument)
       last_measured_rpm = 0.0f;
       atomic_write_float(&pid_output, 0.0f);
       set_fan_speed(0.0f);
-      continue; 
+      continue;
     }
 
     float error = local_setpoint - local_measured;
@@ -669,12 +617,12 @@ void StartPidTask(void *argument)
     float ff_term = calculate_feedforward_pwm(local_setpoint);
     osKernelLock();
     integral += error * PID_SAMPLE_TIME_S;
-    
+
     // Anti-windup: clamp integral considering feedforward contribution
     // The integral term alone should not exceed what's left after feedforward
     float integral_headroom = PID_OUTPUT_MAX - ff_term;
     float integral_floor = PID_OUTPUT_MIN - ff_term;
-    
+
     if (local_Ki > 0.001f)
     {
         float max_integral = integral_headroom / local_Ki;
@@ -693,7 +641,6 @@ void StartPidTask(void *argument)
     last_measured_rpm = local_measured;
     float output = ff_term + p_term + i_term + d_term;
 
-    // Clamp the final output
     if (output > PID_OUTPUT_MAX) output = PID_OUTPUT_MAX;
     if (output < PID_OUTPUT_MIN) output = PID_OUTPUT_MIN;
 
@@ -718,7 +665,6 @@ void StartUsbTask(void *argument)
   {
     uint32_t now_ms = HAL_GetTick();
 
-    // Read shared variables atomically for telemetry
     float local_setpoint = atomic_read_float(&setpoint_rpm);
     float local_measured = atomic_read_float(&measured_rpm);
     float local_output = atomic_read_float(&pid_output);
@@ -730,7 +676,6 @@ void StartUsbTask(void *argument)
              local_measured,
              local_output);
 
-    // Retry USB transmit if busy
     uint8_t retries = 3;
     while (retries > 0)
     {
@@ -749,7 +694,6 @@ void StartUsbTask(void *argument)
 /**
  * @brief Sets the fan's PWM duty cycle.
  * @param duty_cycle The desired duty cycle from 0.0f to 100.0f
- * @retval None
  * @note Automatically clamps input to valid range [0.0, 100.0]
  * @note Updates TIM4 Channel 1 compare register to control PWM output
  */
@@ -767,7 +711,6 @@ void set_fan_speed(float duty_cycle)
 /**
  * @brief External Interrupt ISR callback for tachometer input (PA0).
  * @param GPIO_Pin The GPIO pin that triggered the interrupt
- * @retval None
  * @note Captures timestamp and releases semaphore for tachoTask
  * @note Triggered on falling edge of tachometer signal
  * @note ISR - keep processing minimal
@@ -784,8 +727,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
  * @brief Parses a float from string with validation.
  * @param str Input string to parse
  * @param out Pointer to store the parsed float result
- * @retval true if valid number was successfully parsed
- * @retval false if parsing failed (invalid format, NULL input, etc.)
  * @note Skips leading/trailing whitespace
  * @note Uses strtof for conversion with error checking
  */
@@ -796,7 +737,6 @@ static bool parse_float(const char* str, float* out)
         return false;
     }
 
-    // Skip leading whitespace
     while (*str == ' ' || *str == '\t') str++;
 
     if (*str == '\0')
@@ -808,7 +748,6 @@ static bool parse_float(const char* str, float* out)
     errno = 0;
     float val = strtof(str, &endptr);
 
-    // Check for conversion errors
     if (errno != 0 || endptr == str)
     {
         return false;
@@ -831,7 +770,6 @@ static bool parse_float(const char* str, float* out)
  * @brief Processes received USB data to set RPM and PID gains.
  * @param Buf Buffer of received data
  * @param Len Length of the data buffer
- * @retval None
  * @note Supported commands:
  *       - 's<value>': Set RPM setpoint (0-4000)
  *       - 'm<value>': Set manual PWM mode (0-100%)
@@ -864,28 +802,25 @@ void process_usb_command(uint8_t* Buf, uint32_t Len)
                 {
                     if (Save_Settings())
                     {
-                        // Optional: send success message
+                        CDC_Transmit_FS((uint8_t*)"OK\r\n", 4);
                     }
                     else
                     {
-                        // Optional: send failure message
+                        CDC_Transmit_FS((uint8_t*)"ERR\r\n", 5);
                     }
                 }
                 else if (command_char == 's')
                 {
                     if (parse_float(value_str, &new_val))
                     {
-                        // Switching from manual to setpoint triggers bumpless transfer
-                        if (atomic_read_bool(&manual_mode))
+                        if (manual_mode)
                         {
-                            osKernelLock();
                             pending_bumpless_transfer = true;
-                            osKernelUnlock();
                         }
                         manual_mode = false;
                         if (new_val < 0.0f) new_val = 0.0f;
                         if (new_val > 4000.0f) new_val = 4000.0f;
-                        atomic_write_float(&setpoint_rpm, new_val);
+                        setpoint_rpm = new_val;
                     }
                 }
                 else if (command_char == 'm')
@@ -895,7 +830,7 @@ void process_usb_command(uint8_t* Buf, uint32_t Len)
                         manual_mode = true;
                         if (new_val < 0.0f) new_val = 0.0f;
                         if (new_val > 100.0f) new_val = 100.0f;
-                        atomic_write_float(&manual_pwm, new_val);
+                        manual_pwm = new_val;
                     }
                 }
                 else if (command_char == 'p')
@@ -903,7 +838,7 @@ void process_usb_command(uint8_t* Buf, uint32_t Len)
                     if (parse_float(value_str, &new_val))
                     {
                         if (new_val < 0.0f) new_val = 0.0f;
-                        atomic_write_float(&Kp, new_val);
+                        Kp = new_val;
                     }
                 }
                 else if (command_char == 'i')
@@ -911,7 +846,7 @@ void process_usb_command(uint8_t* Buf, uint32_t Len)
                     if (parse_float(value_str, &new_val))
                     {
                         if (new_val < 0.0f) new_val = 0.0f;
-                        atomic_write_float(&Ki, new_val);
+                        Ki = new_val;
                     }
                 }
                 else if (command_char == 'd')
@@ -919,17 +854,16 @@ void process_usb_command(uint8_t* Buf, uint32_t Len)
                     if (parse_float(value_str, &new_val))
                     {
                         if (new_val < 0.0f) new_val = 0.0f;
-                        atomic_write_float(&Kd, new_val);
+                        Kd = new_val;
                     }
                 }
                 else if (command_char == 'r')
                 {
-                    // New command: set max_rpm
                     if (parse_float(value_str, &new_val))
                     {
                         if (new_val < 100.0f) new_val = 100.0f;
                         if (new_val > 10000.0f) new_val = 10000.0f;
-                        atomic_write_float(&max_rpm, new_val);
+                        max_rpm = new_val;
                     }
                 }
             }
