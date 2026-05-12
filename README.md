@@ -1,111 +1,76 @@
 # STM32 PID Fan Controller
 
-A real-time fan speed controller using PID control with feedforward compensation, implemented on STM32F407VGT6 with FreeRTOS.
+A closed-loop fan speed controller built on STM32F407VG. The goal was to implement a real PID control system on bare metal with FreeRTOS, and actually understand what I was building rather than copy-pasting examples.
 
-## Features
+## Why FreeRTOS
 
-- **PID Control**: Precise RPM control with derivative-on-measurement and anti-windup
-- **Feedforward Compensation**: 9-point lookup table for improved response
-- **Tachometer Feedback**: Real-time RPM measurement with timeout detection
-- **USB CDC Interface**: Live telemetry and interactive command control
-- **Flash Persistence**: Settings saved across power cycles
-- **Manual Override**: Direct PWM control for testing
-- **Bumpless Transfer**: Smooth transition between manual and automatic modes
-- **Thread-Safe Design**: Atomic operations and critical sections for data integrity
+This project could have been done bare-metal in a single loop. FreeRTOS was a deliberate choice to learn it — task priorities, semaphores, and shared state protection under preemption. The three-task structure reflects real concerns: the tachometer needs to respond to hardware events immediately, the PID loop needs to run at a fixed rate, and telemetry shouldn't interfere with either. Using FreeRTOS forced me to think about race conditions and synchronization that a single-loop approach would have hidden.
+
+## How It Works
+
+The fan speed is measured via a tachometer signal on PA0 — two pulses per revolution, falling edge interrupt. Each pulse timestamp is captured from TIM2 (1µs resolution, 32-bit free-running counter), and the RPM is calculated from the interval between consecutive pulses. If no pulse arrives within 1 second, the fan is considered stalled and RPM is set to zero.
+
+The PID loop runs at 40Hz. Output is feedforward + P + I + D, where the feedforward is a 9-point lookup table with linear interpolation, calibrated open-loop against this specific fan. Derivative is calculated on measurement rather than error, which avoids the kick on setpoint changes. Anti-windup clamps the integral relative to what headroom is left after the feedforward contribution, not against absolute output limits.
+
+Transitions from manual PWM mode back to automatic control use bumpless transfer — the integral is back-calculated from the current output so the fan doesn't jerk.
+
+Settings (Kp, Ki, Kd, max RPM) are saved to flash sector 11 with write verification and loaded on boot.
 
 ## Hardware
 
-- **MCU**: STM32F407VGT6 (168MHz)
-- **Fan Control**: 25kHz PWM on PD12 (TIM4_CH1)
-- **Tachometer**: External interrupt on PA0 (falling edge, 2 pulses/rev)
-- **USB**: CDC Virtual COM Port (PA11/PA12)
-
-## Python Interface
-
-The included `fan_controller.py` script provides a clean interface for interacting with the controller:
-
-```bash
-python3 fan_controller.py
-```
-
-**Features:**
-- Continuous telemetry display (Time, Setpoint, Measured RPM, PWM%)
-- Command input without interference from telemetry data
-- Automatic port handling with error messages
-
-**Note:** Update `SERIAL_PORT` in the script if your device appears on a different port (default: `/dev/ttyACM1`).
+- **MCU**: STM32F407VG (168MHz)
+- **Fan control**: 2.5kHz PWM on PD12 (TIM4 CH1)
+- **Tachometer**: EXTI0 on PA0, falling edge, 2 pulses/rev
+- **Interface**: USB CDC virtual COM port (PA11/PA12)
 
 ## Control Architecture
 
-### PID Loop
-- **Sample Rate**: 40Hz (25ms)
-- **Output Range**: 10-95% (0% allowed only at 0 RPM setpoint)
-- **Anti-Windup**: Dynamic clamping accounting for feedforward contribution
-- **Derivative**: Calculated on measurement to prevent derivative kick
+**PID Loop — 40Hz**
+- Output range: 10–95% (0% only when setpoint is 0)
+- Feedforward: 9-point LUT, 740–2830 RPM → 10–90% PWM
+- Anti-windup: integral clamped accounting for feedforward contribution
+- Derivative on measurement
 
-### Feedforward Table
-Linear interpolation between calibration points:
+**Task Structure**
+- `tachoTask` (High priority): event-driven, wakes on semaphore from ISR
+- `pidTask` (Normal priority): fixed 25ms period via `osDelayUntil`
+- `usbTask` (Normal priority): 250ms telemetry transmit with retry
 
-| RPM  | 740 | 1250 | 1600 | 1860 | 2100 | 2325 | 2515 | 2675 | 2830 |
-|------|-----|------|------|------|------|------|------|------|------|
-| PWM% | 10  | 20   | 30   | 40   | 50   | 60   | 70   | 80   | 90   |
+**Thread Safety**
 
-### Task Structure
-- **pidTask** (Priority: Normal): 40Hz PID calculation and output
-- **usbTask** (Priority: Normal): 4Hz telemetry transmission
-- **tachoTask** (Priority: High): RPM measurement with 1000ms timeout
+Shared variables between tasks are protected with `osKernelLock`/`Unlock` wrappers. The PID integral gets a full critical section covering the read-modify-write and clamp. Simple float reads/writes use inline atomic helpers.
 
-## Building
+## Serial Commands
 
-This project uses manually configured clock settings (168MHz operation). The `.ioc` file is **not maintained** and should be ignored - do not regenerate code from STM32CubeMX as it will break the working configuration.
-
-The system is configured for stable USB CDC operation. Clock settings have been tested and should not be modified without thorough USB testing.
-
-## Example Usage
-
-```
-# Set target speed
-s1800
-
-# Adjust PID gains for your fan
-p0.15
-i0.5
-d0.002
-
-# Save settings to flash
-save
-
-# Test manual mode
-m50
-
-# Return to automatic control
-s1800
-```
+| Command | Description |
+|---------|-------------|
+| `s<value>` | Set RPM setpoint (0–4000) |
+| `m<value>` | Manual PWM mode (0–100%) |
+| `p<value>` | Set Kp |
+| `i<value>` | Set Ki |
+| `d<value>` | Set Kd |
+| `r<value>` | Set max RPM limit |
+| `save` | Save settings to flash |
 
 ## Telemetry Output
 
 ```
 Time:   12.50, Set: 1600.0, Meas: 1598.3, PWM: 31.4
 Time:   12.75, Set: 1600.0, Meas: 1601.7, PWM: 31.2
-Time:   13.00, Set: 1600.0, Meas: 1599.5, PWM: 31.3
 ```
 
-## Notes
+## Python Interface
 
-- First tachometer pulse after startup is ignored to eliminate transients
-- Fan reports 0 RPM if no pulses received within 1 second
-- Setpoint of 0 RPM completely stops the fan (0% PWM)
-- Settings are stored in Flash Sector 11 (0x080E0000)
-- Independent watchdog is configured but not currently active
+`fan_controller.py` handles simultaneous telemetry display and command input using two threads. Update `SERIAL_PORT` if your device appears on a different port (default: `/dev/ttyACM1`).
 
-## Future Work
+## Building
 
-- **UART Sensor Integration**: Add external sensor reading (temperature, pressure, etc.) via UART for closed-loop environmental control
-- **Watchdog Implementation**: Enable and feed IWDG for fault detection and automatic recovery
-- **Multi-Fan Control**: Expand to control multiple fans with independent PID loops
-- **Adaptive Tuning**: Implement auto-tuning for PID parameters based on system response
-- **Data Logging**: Add SD card logging for long-term performance analysis
+Manual clock configuration for 168MHz operation. Do not regenerate from STM32CubeMX — it will break the working configuration.
 
-## License
+## Possible Improvements
 
-This is a portfolio project demonstrating embedded control systems design.
+- IWDG is initialized but never fed — fault recovery is unfinished
+- Bumpless transfer only handles manual→auto; auto→manual has no equivalent
+- `tx_buffer` is a global but is only used in `usbTask`
+- Auto-tuning PID parameters based on step response
+- Data logging to SD card for long-term performance analysis
