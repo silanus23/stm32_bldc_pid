@@ -37,7 +37,11 @@ BUILD_DIR = build
 # C sources
 C_SOURCES =  \
 Core/Src/main.c \
-Core/Src/freertos.c \
+Core/Src/pid.c \
+Core/Src/tacho.c \
+Core/Src/command.c \
+Core/Src/settings.c \
+Core/Src/settings_flash.c \
 Core/Src/stm32f4xx_it.c \
 Core/Src/stm32f4xx_hal_msp.c \
 USB_DEVICE/App/usb_device.c \
@@ -230,6 +234,19 @@ $(BUILD_DIR):
 #######################################
 clean:
 	-rm -fR $(BUILD_DIR)
+
+#######################################
+# host-side unit tests (pure modules only, no HAL)
+#######################################
+HOST_CC ?= gcc
+TEST_SOURCES = tests/test_main.c Core/Src/pid.c Core/Src/tacho.c Core/Src/command.c Core/Src/settings.c
+
+test: $(TEST_SOURCES)
+	mkdir -p $(BUILD_DIR)/test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -ICore/Inc $(TEST_SOURCES) -lm -o $(BUILD_DIR)/test/run_tests
+	./$(BUILD_DIR)/test/run_tests
+
+.PHONY: all clean test
   
 #######################################
 # dependencies

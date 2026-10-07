@@ -55,6 +55,8 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
+/* Called from CDC_Receive_FS (USB ISR context) */
+void process_usb_command(const uint8_t *Buf, uint32_t Len);
 
 /* USER CODE END EFP */
 

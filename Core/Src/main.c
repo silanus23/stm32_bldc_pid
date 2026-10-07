@@ -2,7 +2,7 @@
 /**
  ******************************************************************************
  * @file              : main.c
- * @brief             : Main program body for STM32F407G-DISC1 PID Fan Controller
+ * @brief             : STM32F407G-DISC1 PID fan controller: init, RTOS tasks, ISRs
  ******************************************************************************
  */
 /* USER CODE END Header */
@@ -17,36 +17,38 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
-#include <ctype.h>
-#include <stdlib.h>
-#include <errno.h>
-#include "stm32f4xx_hal_iwdg.h"
-#include "stm32f4xx_ll_iwdg.h"
+#include "app_config.h"
+#include "pid.h"
+#include "tacho.h"
+#include "command.h"
+#include "settings.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-/* Packed struct to avoid padding issues in flash storage */
-typedef struct __attribute__((packed)) {
-    uint32_t magic_number;
-    float Kp;
-    float Ki;
-    float Kd;
-    float max_rpm;
-} Flash_Settings;
+/* Consistent snapshot of everything the USB ISR can change */
+typedef struct {
+    bool manual;
+    bool bumpless;
+    float setpoint;
+    float manual_pwm;
+    pid_gains_t gains;
+} control_inputs_t;
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define PULSES_PER_REVOLUTION 2.0f
-#define TACHO_TIMEOUT_MS 1000
-#define PID_SAMPLE_TIME_S 0.025f
-#define PID_OUTPUT_MAX 95.0f
-#define PID_OUTPUT_MIN 10.0f
-#define FLASH_SETTINGS_ADDRESS  0x080E0000
-#define FLASH_MAGIC_NUMBER      0xDEADBEEF
+#define USB_FLAG_SAVE_REQUEST   0x0001U
+#define USB_FLAG_CMD_ERROR      0x0002U
+#define USB_FLAGS_ALL           (USB_FLAG_SAVE_REQUEST | USB_FLAG_CMD_ERROR)
+
+/* STM32F407G-DISC1 user LEDs (PD12 / green is used as the PWM output) */
+#define LED_GPIO_PORT           GPIOD
+#define LED_ORANGE_PIN          GPIO_PIN_13     /* on after a watchdog reset */
+#define LED_RED_PIN             GPIO_PIN_14     /* on in Error_Handler */
+#define LED_BLUE_PIN            GPIO_PIN_15
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -57,6 +59,7 @@ typedef struct __attribute__((packed)) {
 /* Private variables ---------------------------------------------------------*/
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim4;
+IWDG_HandleTypeDef hiwdg;
 
 osThreadId_t pidTaskHandle;
 const osThreadAttr_t pidTask_attributes = {
@@ -82,34 +85,28 @@ const osSemaphoreAttr_t tachoSemaphore_attributes = {
 };
 /* USER CODE BEGIN PV */
 
-// PID Configuration
-volatile float Kp = 0.1f;
-volatile float Ki = 0.7f;
-volatile float Kd = 0.001f;
+/* Written by the USB ISR, read by tasks through read_control_inputs() */
+static volatile float setpoint_rpm = DEFAULT_SETPOINT_RPM;
+static volatile float manual_pwm = 0.0f;
+static volatile bool  manual_mode = false;
+static volatile bool  pending_bumpless_transfer = false;
+static volatile float Kp = DEFAULT_KP;
+static volatile float Ki = DEFAULT_KI;
+static volatile float Kd = DEFAULT_KD;
+static volatile float max_rpm = DEFAULT_MAX_RPM;
 
-// Shared State Variables
-volatile float setpoint_rpm = 1600.0f;
-volatile float measured_rpm = 0.0f;
-volatile float pid_output = 0.0f;
-volatile float integral = 0.0f;
-volatile float max_rpm = 3100.0f;
+/* Written by one task, read by others (single-word accesses are atomic) */
+static volatile float measured_rpm = 0.0f;
+static volatile float pid_output = 0.0f;
+static volatile bool  tacho_timeout = false;
+static volatile bool  flash_busy = false;
+static volatile uint32_t heartbeat_tacho_ms = 0;
+static volatile uint32_t heartbeat_usb_ms = 0;
 
-// RPM Measurement Variables
-volatile uint32_t last_capture_time_us = 0;
-volatile uint32_t current_capture_time_us = 0;
+/* Written by the EXTI0 ISR, read by tachoTask */
+static volatile uint32_t tacho_capture_us = 0;
 
-volatile bool manual_mode = false;
-volatile float manual_pwm = 0.0f;
-
-volatile bool pending_bumpless_transfer = false;
-
-// Debugging
-char tx_buffer[128];
-
-const int num_ff_points = 9;
-const float ff_rpm_points[] = { 740, 1250, 1600, 1860, 2100, 2325, 2515, 2675, 2830 };
-const float ff_pwm_points[] = { 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0 };
-
+static bool watchdog_reset_occurred = false;
 
 /* USER CODE END PV */
 
@@ -118,45 +115,14 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_IWDG_Init(void);
 void StartPidTask(void *argument);
 void StartUsbTask(void *argument);
 void StartTachoTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-void set_fan_speed(float duty_cycle);
-void process_usb_command(uint8_t* Buf, uint32_t Len);
-bool Save_Settings(void);
-void Load_Settings(void);
-float calculate_feedforward_pwm(float rpm);
-
-/* Task-context only. Not safe to call from ISR. */
-static inline float atomic_read_float(volatile float *ptr)
-{
-    float val;
-    osKernelLock();
-    val = *ptr;
-    osKernelUnlock();
-    return val;
-}
-
-/* Task-context only. Not safe to call from ISR. */
-static inline bool atomic_read_bool(volatile bool *ptr)
-{
-    bool val;
-    osKernelLock();
-    val = *ptr;
-    osKernelUnlock();
-    return val;
-}
-
-/* Task-context only. Not safe to call from ISR. */
-static inline void atomic_write_float(volatile float *ptr, float val)
-{
-    osKernelLock();
-    *ptr = val;
-    osKernelUnlock();
-}
-
+static void set_fan_speed(float duty_cycle);
+static void watchdog_service(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -172,9 +138,23 @@ int main(void)
 {
   /* MCU Configuration--------------------------------------------------------*/
   HAL_Init();
-  Load_Settings();
 
   SystemClock_Config();
+
+  /* USER CODE BEGIN Init */
+  watchdog_reset_occurred = (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST) != RESET);
+  __HAL_RCC_CLEAR_RESET_FLAGS();
+
+  settings_t settings;
+  if (settings_load(&settings))
+  {
+    Kp = settings.kp;
+    Ki = settings.ki;
+    Kd = settings.kd;
+    max_rpm = settings.max_rpm;
+    if (setpoint_rpm > max_rpm) setpoint_rpm = max_rpm;
+  }
+  /* USER CODE END Init */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
@@ -183,6 +163,10 @@ int main(void)
   MX_USB_DEVICE_Init();
 
   /* USER CODE BEGIN 2 */
+  if (watchdog_reset_occurred)
+  {
+    HAL_GPIO_WritePin(LED_GPIO_PORT, LED_ORANGE_PIN, GPIO_PIN_SET);
+  }
   // Start the microsecond timer
   HAL_TIM_Base_Start(&htim2);
   // Start the PWM timer channel
@@ -197,6 +181,15 @@ int main(void)
   pidTaskHandle = osThreadNew(StartPidTask, NULL, &pidTask_attributes);
   usbTaskHandle = osThreadNew(StartUsbTask, NULL, &usbTask_attributes);
   tachoTaskHandle = osThreadNew(StartTachoTask, NULL, &tachoTask_attributes);
+
+  if (tachoSemaphoreHandle == NULL || pidTaskHandle == NULL ||
+      usbTaskHandle == NULL || tachoTaskHandle == NULL)
+  {
+    Error_Handler();
+  }
+
+  /* Started last so the init above cannot trip it */
+  MX_IWDG_Init();
 
   /* Start scheduler */
   osKernelStart();
@@ -331,11 +324,25 @@ static void MX_TIM4_Init(void)
 }
 
 /**
+ * @brief IWDG Initialization Function (~8 s timeout, longer than a flash erase)
+ */
+static void MX_IWDG_Init(void)
+{
+  __HAL_DBGMCU_FREEZE_IWDG();
+
+  hiwdg.Instance = IWDG;
+  hiwdg.Init.Prescaler = IWDG_PRESCALER_128;
+  hiwdg.Init.Reload = 2000;
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
  * @brief GPIO Initialization Function
  * @param None
- * @note Configures PA0 as tachometer input with falling edge interrupt
- * @note Configures PD12-PD15 as outputs for onboard LEDs
- * @note Enables EXTI0 interrupt for tachometer signal
+ * @note PA0 tach input (falling-edge EXTI0), PD13-PD15 LEDs
  */
 static void MX_GPIO_Init(void)
 {
@@ -345,18 +352,18 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
-  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LED_GPIO_PORT, LED_ORANGE_PIN|LED_RED_PIN|LED_BLUE_PIN, GPIO_PIN_RESET);
 
   GPIO_InitStruct.Pin = GPIO_PIN_0;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  GPIO_InitStruct.Pin = GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15;
+  GPIO_InitStruct.Pin = LED_ORANGE_PIN|LED_RED_PIN|LED_BLUE_PIN;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+  HAL_GPIO_Init(LED_GPIO_PORT, &GPIO_InitStruct);
 
   HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(EXTI0_IRQn);
@@ -365,164 +372,84 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /**
- * @brief Calculates the feedforward PWM value using linear interpolation.
- * @param rpm The target RPM for which to calculate PWM
- * @retval The estimated PWM value (percentage) required to achieve the target RPM
- * @note Uses predefined lookup table with linear interpolation between points
+ * @brief Reads the ISR-written inputs with interrupts off, so they are consistent.
  */
-float calculate_feedforward_pwm(float rpm)
+static control_inputs_t read_control_inputs(void)
 {
-    if (rpm <= ff_rpm_points[0])
-    {
-        return ff_pwm_points[0];
-    }
-    if (rpm >= ff_rpm_points[num_ff_points - 1])
-    {
-        return ff_pwm_points[num_ff_points - 1];
-    }
+  control_inputs_t in;
 
-    for (int i = 0; i < num_ff_points - 1; i++)
-    {
-        if (rpm >= ff_rpm_points[i] && rpm <= ff_rpm_points[i + 1])
-        {
-            float x0 = ff_rpm_points[i];
-            float y0 = ff_pwm_points[i];
-            float x1 = ff_rpm_points[i + 1];
-            float y1 = ff_pwm_points[i + 1];
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  in.manual = manual_mode;
+  in.bumpless = pending_bumpless_transfer;
+  pending_bumpless_transfer = false;
+  in.setpoint = setpoint_rpm;
+  in.manual_pwm = manual_pwm;
+  in.gains.kp = Kp;
+  in.gains.ki = Ki;
+  in.gains.kd = Kd;
+  __set_PRIMASK(primask);
 
-            return y0 + (rpm - x0) * (y1 - y0) / (x1 - x0);
-        }
-    }
-
-    return 0.0f;
+  return in;
 }
 
 /**
- * @brief Saves PID settings to flash memory with verification.
- * @note Saves Kp, Ki, Kd, and max_rpm to flash sector 11
- * @note Automatically unlocks and locks flash during operation
+ * @brief Refreshes the IWDG only while tachoTask and usbTask are still alive.
  */
-bool Save_Settings(void)
+static void watchdog_service(void)
 {
-    Flash_Settings settings;
-    settings.magic_number = FLASH_MAGIC_NUMBER;
-    settings.Kp = Kp;
-    settings.Ki = Ki;
-    settings.Kd = Kd;
-    settings.max_rpm = max_rpm;
-
-    bool success = true;
-
-    HAL_FLASH_Unlock();
-    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR | FLASH_FLAG_PGAERR | FLASH_FLAG_PGPERR | FLASH_FLAG_PGSERR);
-
-    FLASH_EraseInitTypeDef EraseInitStruct;
-    EraseInitStruct.TypeErase = FLASH_TYPEERASE_SECTORS;
-    EraseInitStruct.VoltageRange = FLASH_VOLTAGE_RANGE_3;
-    EraseInitStruct.Sector = FLASH_SECTOR_11;
-    EraseInitStruct.NbSectors = 1;
-    uint32_t SectorError = 0;
-
-    if (HAL_FLASHEx_Erase(&EraseInitStruct, &SectorError) == HAL_OK)
-    {
-        uint32_t* p_settings = (uint32_t*)&settings;
-        uint32_t num_words = (sizeof(Flash_Settings) + 3) / 4;
-
-        for (uint32_t i = 0; i < num_words; i++)
-        {
-            if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, FLASH_SETTINGS_ADDRESS + (i * 4), p_settings[i]) != HAL_OK)
-            {
-                success = false;
-                break;
-            }
-        }
-
-        if (success)
-        {
-            uint32_t* flash_data = (uint32_t*)FLASH_SETTINGS_ADDRESS;
-            for (uint32_t i = 0; i < num_words; i++)
-            {
-                if (flash_data[i] != p_settings[i])
-                {
-                    success = false;
-                    break;
-                }
-            }
-        }
-    }
-    else
-    {
-        success = false;
-    }
-
-    HAL_FLASH_Lock();
-    return success;
+  uint32_t now = osKernelGetTickCount();
+  if ((now - heartbeat_tacho_ms) < WATCHDOG_TASK_TIMEOUT_MS &&
+      (now - heartbeat_usb_ms) < WATCHDOG_TASK_TIMEOUT_MS)
+  {
+    HAL_IWDG_Refresh(&hiwdg);
+  }
 }
-
-/**
- * @brief Loads PID settings from flash memory if valid magic number is present.
- * @note Validates flash data using magic number before loading
- * @note If magic number is invalid, default values are retained
- * @note Loads Kp, Ki, Kd, and max_rpm from flash sector 11
- */
-void Load_Settings(void)
-{
-    uint32_t magic_check = *(__IO uint32_t*)FLASH_SETTINGS_ADDRESS;
-
-    if (magic_check == FLASH_MAGIC_NUMBER)
-    {
-        Kp = *(__IO float*)(FLASH_SETTINGS_ADDRESS + 4);
-        Ki = *(__IO float*)(FLASH_SETTINGS_ADDRESS + 8);
-        Kd = *(__IO float*)(FLASH_SETTINGS_ADDRESS + 12);
-        max_rpm = *(__IO float*)(FLASH_SETTINGS_ADDRESS + 16);
-    }
-}
-
 
 /**
  * @brief Function implementing the tachoTask thread.
  * @param argument Unused thread argument (required by RTOS)
- * @note Calculates RPM from tachometer pulses using time measurement
- * @note Implements timeout detection for stalled fan conditions
- * @note Rejects first pulse after startup to avoid measurement errors
- * @note High priority task to ensure accurate timing measurements
+ * @note Calculates RPM from the time between tachometer pulses
  */
 void StartTachoTask(void *argument)
 {
   bool is_first_pulse = true;
-  float local_max_rpm;
+  uint32_t last_capture_us = 0;
 
   for (;;)
   {
+    heartbeat_tacho_ms = osKernelGetTickCount();
+
     if (osSemaphoreAcquire(tachoSemaphoreHandle, TACHO_TIMEOUT_MS) == osOK)
     {
-      if (is_first_pulse) {
-        is_first_pulse = false;
-        last_capture_time_us = current_capture_time_us;
+      uint32_t capture_us = tacho_capture_us;
+
+      if (flash_busy)
+      {
+        is_first_pulse = true;
         continue;
       }
 
-      uint32_t dt_us = current_capture_time_us - last_capture_time_us;
-      last_capture_time_us = current_capture_time_us;
+      if (is_first_pulse)
+      {
+        is_first_pulse = false;
+        last_capture_us = capture_us;
+        continue;
+      }
 
-      if (dt_us > 0) {
-        float new_rpm = (60000000.0f) / (dt_us * PULSES_PER_REVOLUTION);
+      uint32_t period_us = capture_us - last_capture_us;   // wrap-safe
+      last_capture_us = capture_us;
 
-        local_max_rpm = atomic_read_float(&max_rpm);
-        if (new_rpm <= local_max_rpm)
-        {
-            atomic_write_float(&measured_rpm, new_rpm);
-        }
+      float rpm;
+      if (tacho_rpm_from_period(period_us, &rpm))
+      {
+        measured_rpm = rpm;
       }
     }
     else
     {
-      atomic_write_float(&measured_rpm, 0.0f);
-
-      osKernelLock();
-      integral = 0.0f;
-      osKernelUnlock();
-
+      measured_rpm = 0.0f;
+      tacho_timeout = true;
       is_first_pulse = true;
     }
   }
@@ -531,366 +458,251 @@ void StartTachoTask(void *argument)
 /**
  * @brief Function implementing the PID controller task thread.
  * @param argument Unused thread argument (required by RTOS)
- * @note Executes at fixed sample time defined by PID_SAMPLE_TIME_S
- * @note Implements feedforward control with PID feedback
- * @note Uses derivative-on-measurement to prevent derivative kick
- * @note Includes anti-windup with feedforward compensation
- * @note Supports bumpless transfer from manual to automatic mode
- * @note Enforces minimum 10% PWM output (except when setpoint is 0)
+ * @note Runs every PID_SAMPLE_TIME_MS and services the watchdog
  */
 void StartPidTask(void *argument)
 {
-  float last_measured_rpm = 0.0f;
-  uint32_t tick = osKernelGetTickCount();
+  pid_state_t pid;
+  pid_reset(&pid);
 
   osDelay(2000);
 
-  for(;;)
+  uint32_t tick = osKernelGetTickCount();
+
+  for (;;)
   {
-    tick += (uint32_t)(PID_SAMPLE_TIME_S * 1000.0f);
-    osDelayUntil(tick);
-
-    bool is_manual = atomic_read_bool(&manual_mode);
-    float local_setpoint = atomic_read_float(&setpoint_rpm);
-    float local_measured = atomic_read_float(&measured_rpm);
-    float local_manual_pwm = atomic_read_float(&manual_pwm);
-    float local_Kp = atomic_read_float(&Kp);
-    float local_Ki = atomic_read_float(&Ki);
-    float local_Kd = atomic_read_float(&Kd);
-
-    osKernelLock();
-    bool do_bumpless = pending_bumpless_transfer;
-    pending_bumpless_transfer = false;
-    osKernelUnlock();
-
-    if (do_bumpless && !is_manual)
+    tick += PID_SAMPLE_TIME_MS;
+    if (osDelayUntil(tick) != osOK)
     {
-        float ff_term = calculate_feedforward_pwm(local_setpoint);
-        float current_output = atomic_read_float(&pid_output);
-        float error = local_setpoint - local_measured;
-        float p_term = local_Kp * error;
-
-        // Back-calculate integral: output = ff + p + Ki*integral
-        // So integral = (output - ff - p) / Ki
-        if (local_Ki > 0.001f)
-        {
-            float new_integral = (current_output - ff_term - p_term) / local_Ki;
-
-            // Clamp using same limits as normal anti-windup
-            float integral_headroom = PID_OUTPUT_MAX - ff_term;
-            float integral_floor = PID_OUTPUT_MIN - ff_term;
-            float max_integral = integral_headroom / local_Ki;
-            float min_integral = integral_floor / local_Ki;
-
-            if (new_integral > max_integral) new_integral = max_integral;
-            else if (new_integral < min_integral) new_integral = min_integral;
-
-            osKernelLock();
-            integral = new_integral;
-            osKernelUnlock();
-        }
-        last_measured_rpm = local_measured;
+      // Deadline missed (flash erase stall): resync
+      tick = osKernelGetTickCount();
     }
 
-    if (is_manual)
+    watchdog_service();
+
+    control_inputs_t in = read_control_inputs();
+    float measured = measured_rpm;
+
+    if (tacho_timeout)
     {
-        set_fan_speed(local_manual_pwm);
-        atomic_write_float(&pid_output, local_manual_pwm);
-        continue;
+      tacho_timeout = false;
+      pid_reset(&pid);
     }
 
-    if (local_setpoint <= 0.0f)
+    if (in.bumpless && !in.manual)
     {
-      osKernelLock();
-      integral = 0.0f;
-      osKernelUnlock();
-
-      last_measured_rpm = 0.0f;
-      atomic_write_float(&pid_output, 0.0f);
-      set_fan_speed(0.0f);
-      continue;
+      pid_bumpless_transfer(&pid, &in.gains, in.setpoint, measured, pid_output);
     }
 
-    float error = local_setpoint - local_measured;
-
-    float p_term = local_Kp * error;
-    float ff_term = calculate_feedforward_pwm(local_setpoint);
-    osKernelLock();
-    integral += error * PID_SAMPLE_TIME_S;
-
-    // Anti-windup: clamp integral considering feedforward contribution
-    // The integral term alone should not exceed what's left after feedforward
-    float integral_headroom = PID_OUTPUT_MAX - ff_term;
-    float integral_floor = PID_OUTPUT_MIN - ff_term;
-
-    if (local_Ki > 0.001f)
+    float output;
+    if (in.manual)
     {
-        float max_integral = integral_headroom / local_Ki;
-        float min_integral = integral_floor / local_Ki;
-        if (integral > max_integral) integral = max_integral;
-        else if (integral < min_integral) integral = min_integral;
+      output = in.manual_pwm;
     }
-    float current_integral = integral;
-    osKernelUnlock();
+    else
+    {
+      output = pid_update(&pid, &in.gains, in.setpoint, measured, PID_SAMPLE_TIME_S);
+    }
 
-    float i_term = local_Ki * current_integral;
-
-    float derivative = -(local_measured - last_measured_rpm) / PID_SAMPLE_TIME_S;
-    float d_term = local_Kd * derivative;
-
-    last_measured_rpm = local_measured;
-    float output = ff_term + p_term + i_term + d_term;
-
-    if (output > PID_OUTPUT_MAX) output = PID_OUTPUT_MAX;
-    if (output < PID_OUTPUT_MIN) output = PID_OUTPUT_MIN;
-
-    atomic_write_float(&pid_output, output);
+    pid_output = output;
     set_fan_speed(output);
+  }
+}
+
+/**
+ * @brief Sends a string over USB CDC, retrying while the endpoint is busy.
+ */
+static void usb_transmit_retry(const char *str)
+{
+  uint8_t retries = 3;
+  while (retries > 0)
+  {
+    if (CDC_Transmit_FS((uint8_t *)str, strlen(str)) == USBD_OK)
+    {
+      break;
+    }
+    retries--;
+    osDelay(10);
   }
 }
 
 /**
  * @brief Function implementing the USB telemetry task thread.
  * @param argument Unused thread argument (required by RTOS)
- * @retval None
- * @note Transmits telemetry data via USB CDC at 250ms intervals
- * @note Implements retry logic for USB transmit failures
- * @note Reports timestamp, setpoint, measured RPM, and PWM output
+ * @note Sends telemetry and replies, and runs flash saves requested by the USB ISR
  */
 void StartUsbTask(void *argument)
 {
+  // Static: CDC_Transmit_FS keeps the pointer until the transfer completes
+  static char tx_buffer[96];
+
+  heartbeat_usb_ms = osKernelGetTickCount();
   osDelay(2500);
 
-  for(;;)
+  if (watchdog_reset_occurred)
   {
-    uint32_t now_ms = HAL_GetTick();
+    usb_transmit_retry("WARN: previous reset was caused by the watchdog\r\n");
+  }
 
-    float local_setpoint = atomic_read_float(&setpoint_rpm);
-    float local_measured = atomic_read_float(&measured_rpm);
-    float local_output = atomic_read_float(&pid_output);
+  uint32_t next_ms = osKernelGetTickCount();
 
-    snprintf(tx_buffer, sizeof(tx_buffer),
-             "Time: %7.2f, Set: %.1f, Meas: %.1f, PWM: %.1f\r\n",
-             (float)now_ms / 1000.0f,
-             local_setpoint,
-             local_measured,
-             local_output);
+  for (;;)
+  {
+    uint32_t now = osKernelGetTickCount();
+    heartbeat_usb_ms = now;
 
-    uint8_t retries = 3;
-    while (retries > 0)
+    uint32_t wait = ((int32_t)(next_ms - now) > 0) ? (next_ms - now) : 0;
+    uint32_t flags = osThreadFlagsWait(USB_FLAGS_ALL, osFlagsWaitAny, wait);
+
+    if (!(flags & osFlagsError))
     {
-        if (CDC_Transmit_FS((uint8_t*)tx_buffer, strlen(tx_buffer)) == USBD_OK)
-        {
-            break;
-        }
-        retries--;
-        osDelay(10);
+      if (flags & USB_FLAG_CMD_ERROR)
+      {
+        usb_transmit_retry("ERR: invalid command\r\n");
+      }
+      if (flags & USB_FLAG_SAVE_REQUEST)
+      {
+        control_inputs_t in = read_control_inputs();
+        settings_t s = settings_make(in.gains.kp, in.gains.ki, in.gains.kd, max_rpm);
+
+        // Tach pulses delayed by the erase stall are discarded by tachoTask
+        flash_busy = true;
+        bool ok = settings_save(&s);
+        flash_busy = false;
+        usb_transmit_retry(ok ? "OK: saved\r\n" : "ERR: save failed\r\n");
+      }
+      continue;
     }
 
-    osDelay(250);
+    next_ms += TELEMETRY_PERIOD_MS;
+    if ((int32_t)(osKernelGetTickCount() - next_ms) > 0)
+    {
+      next_ms = osKernelGetTickCount() + TELEMETRY_PERIOD_MS;
+    }
+
+    uint32_t now_ms = HAL_GetTick();
+    snprintf(tx_buffer, sizeof(tx_buffer),
+             "Time: %4lu.%02lu, Set: %.1f, Meas: %.1f, PWM: %.1f\r\n",
+             (unsigned long)(now_ms / 1000), (unsigned long)((now_ms % 1000) / 10),
+             (double)setpoint_rpm, (double)measured_rpm, (double)pid_output);
+
+    usb_transmit_retry(tx_buffer);
   }
 }
 
 /**
  * @brief Sets the fan's PWM duty cycle.
- * @param duty_cycle The desired duty cycle from 0.0f to 100.0f
- * @note Automatically clamps input to valid range [0.0, 100.0]
- * @note Updates TIM4 Channel 1 compare register to control PWM output
+ * @param duty_cycle The desired duty cycle from 0.0f to 100.0f (clamped)
  */
-void set_fan_speed(float duty_cycle)
+static void set_fan_speed(float duty_cycle)
 {
-    if (duty_cycle < 0.0f) duty_cycle = 0.0f;
-    if (duty_cycle > 100.0f) duty_cycle = 100.0f;
+  if (duty_cycle < 0.0f) duty_cycle = 0.0f;
+  if (duty_cycle > 100.0f) duty_cycle = 100.0f;
 
-    uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim4);
-    uint32_t ccr = (uint32_t)((duty_cycle / 100.0f) * arr);
+  uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim4);
+  // CCR > ARR gives 100% duty
+  uint32_t ccr = (uint32_t)((duty_cycle / 100.0f) * (arr + 1));
 
-    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, ccr);
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, ccr);
 }
 
 /**
  * @brief External Interrupt ISR callback for tachometer input (PA0).
  * @param GPIO_Pin The GPIO pin that triggered the interrupt
- * @note Captures timestamp and releases semaphore for tachoTask
- * @note Triggered on falling edge of tachometer signal
- * @note ISR - keep processing minimal
  */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    if (GPIO_Pin == GPIO_PIN_0) {
-        current_capture_time_us = __HAL_TIM_GET_COUNTER(&htim2);
-        osSemaphoreRelease(tachoSemaphoreHandle);
-    }
+  if (GPIO_Pin == GPIO_PIN_0)
+  {
+    tacho_capture_us = __HAL_TIM_GET_COUNTER(&htim2);
+    osSemaphoreRelease(tachoSemaphoreHandle);
+  }
 }
 
 /**
- * @brief Parses a float from string with validation.
- * @param str Input string to parse
- * @param out Pointer to store the parsed float result
- * @note Skips leading/trailing whitespace
- * @note Uses strtof for conversion with error checking
+ * @brief Applies one parsed command to the shared state (USB ISR context).
  */
-static bool parse_float(const char* str, float* out)
+static void apply_command(command_t cmd)
 {
-    if (str == NULL || *str == '\0')
+  switch (cmd.type)
+  {
+  case CMD_SETPOINT:
+    if (manual_mode)
     {
-        return false;
+      pending_bumpless_transfer = true;
     }
-
-    while (*str == ' ' || *str == '\t') str++;
-
-    if (*str == '\0')
+    manual_mode = false;
+    setpoint_rpm = (cmd.value > max_rpm) ? max_rpm : cmd.value;
+    break;
+  case CMD_MANUAL:
+    manual_pwm = cmd.value;
+    manual_mode = true;
+    break;
+  case CMD_KP:
+    Kp = cmd.value;
+    break;
+  case CMD_KI:
+    Ki = cmd.value;
+    break;
+  case CMD_KD:
+    Kd = cmd.value;
+    break;
+  case CMD_MAX_RPM:
+    max_rpm = cmd.value;
+    if (setpoint_rpm > max_rpm)
     {
-        return false;
+      setpoint_rpm = max_rpm;
     }
-
-    char* endptr;
-    errno = 0;
-    float val = strtof(str, &endptr);
-
-    if (errno != 0 || endptr == str)
-    {
-        return false;
-    }
-
-    // Skip trailing whitespace
-    while (*endptr == ' ' || *endptr == '\t') endptr++;
-
-    // Should have consumed entire string (or only whitespace remains)
-    if (*endptr != '\0')
-    {
-        return false;
-    }
-
-    *out = val;
-    return true;
+    break;
+  case CMD_SAVE:
+    // Flash erase must not run in the ISR: defer to usbTask
+    osThreadFlagsSet(usbTaskHandle, USB_FLAG_SAVE_REQUEST);
+    break;
+  case CMD_INVALID:
+  default:
+    osThreadFlagsSet(usbTaskHandle, USB_FLAG_CMD_ERROR);
+    break;
+  }
 }
 
 /**
- * @brief Processes received USB data to set RPM and PID gains.
- * @param Buf Buffer of received data
- * @param Len Length of the data buffer
- * @note Supported commands:
- *       - 's<value>': Set RPM setpoint (0-4000)
- *       - 'm<value>': Set manual PWM mode (0-100%)
- *       - 'p<value>': Set proportional gain Kp
- *       - 'i<value>': Set integral gain Ki
- *       - 'd<value>': Set derivative gain Kd
- *       - 'r<value>': Set max RPM limit (100-10000)
- *       - 'save': Save settings to flash
- * @note Implements bumpless transfer when switching from manual to automatic
- * @note Uses robust parsing with validation
+ * @brief Processes received USB data (USB ISR context, called from CDC_Receive_FS).
  */
-void process_usb_command(uint8_t* Buf, uint32_t Len)
+void process_usb_command(const uint8_t *Buf, uint32_t Len)
 {
-    static char command_buffer[64];
-    static uint32_t buffer_idx = 0;
+  static command_line_t line_buf;
 
-    for(uint32_t i = 0; i < Len; i++)
+  for (uint32_t i = 0; i < Len; i++)
+  {
+    const char *line;
+    if (command_line_feed(&line_buf, Buf[i], &line))
     {
-        if (Buf[i] == '\n' || Buf[i] == '\r')
-        {
-            command_buffer[buffer_idx] = '\0';
-
-            if (buffer_idx > 0)
-            {
-                char command_char = tolower(command_buffer[0]);
-                char* value_str = &command_buffer[1];
-                float new_val = 0.0f;
-
-                if (strncmp(command_buffer, "save", 4) == 0)
-                {
-                    if (Save_Settings())
-                    {
-                        CDC_Transmit_FS((uint8_t*)"OK\r\n", 4);
-                    }
-                    else
-                    {
-                        CDC_Transmit_FS((uint8_t*)"ERR\r\n", 5);
-                    }
-                }
-                else if (command_char == 's')
-                {
-                    if (parse_float(value_str, &new_val))
-                    {
-                        if (manual_mode)
-                        {
-                            pending_bumpless_transfer = true;
-                        }
-                        manual_mode = false;
-                        if (new_val < 0.0f) new_val = 0.0f;
-                        if (new_val > 4000.0f) new_val = 4000.0f;
-                        setpoint_rpm = new_val;
-                    }
-                }
-                else if (command_char == 'm')
-                {
-                    if (parse_float(value_str, &new_val))
-                    {
-                        manual_mode = true;
-                        if (new_val < 0.0f) new_val = 0.0f;
-                        if (new_val > 100.0f) new_val = 100.0f;
-                        manual_pwm = new_val;
-                    }
-                }
-                else if (command_char == 'p')
-                {
-                    if (parse_float(value_str, &new_val))
-                    {
-                        if (new_val < 0.0f) new_val = 0.0f;
-                        Kp = new_val;
-                    }
-                }
-                else if (command_char == 'i')
-                {
-                    if (parse_float(value_str, &new_val))
-                    {
-                        if (new_val < 0.0f) new_val = 0.0f;
-                        Ki = new_val;
-                    }
-                }
-                else if (command_char == 'd')
-                {
-                    if (parse_float(value_str, &new_val))
-                    {
-                        if (new_val < 0.0f) new_val = 0.0f;
-                        Kd = new_val;
-                    }
-                }
-                else if (command_char == 'r')
-                {
-                    if (parse_float(value_str, &new_val))
-                    {
-                        if (new_val < 100.0f) new_val = 100.0f;
-                        if (new_val > 10000.0f) new_val = 10000.0f;
-                        max_rpm = new_val;
-                    }
-                }
-            }
-
-            buffer_idx = 0;
-            memset(command_buffer, 0, sizeof(command_buffer));
-        }
-        else
-        {
-            if (buffer_idx < sizeof(command_buffer) - 1)
-            {
-                command_buffer[buffer_idx++] = Buf[i];
-            }
-        }
+      apply_command(command_parse(line));
     }
+  }
 }
 
 /* USER CODE END 4 */
 
 /**
   * @brief  This function is executed in case of error occurrence.
+  * @note   Turns on the red LED and halts; the IWDG (if started) resets the MCU.
   * @retval None
   */
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   __disable_irq();
+
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  GPIO_InitStruct.Pin = LED_RED_PIN;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LED_GPIO_PORT, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(LED_GPIO_PORT, LED_RED_PIN, GPIO_PIN_SET);
+
   while (1)
   {
   }

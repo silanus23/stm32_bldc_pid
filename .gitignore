@@ -41,3 +41,13 @@ Thumbs.db
 *.bak
 *.tmp
 *.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Local test output and notes
+results/
+test_log.txt
+CODE_REVIEW.md
+.claude/
